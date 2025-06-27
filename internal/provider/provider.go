@@ -71,9 +71,7 @@ func (p *clickhouseSchemaProvider) Configure(ctx context.Context, req provider.C
 
 func (p *clickhouseSchemaProvider) Resources(ctx context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
-		// TODO: Add your resources here
-		// NewTableResource,
-		// NewDatabaseResource,
+		NewTableResource,
 	}
 }
 

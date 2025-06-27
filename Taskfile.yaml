@@ -1,0 +1,29 @@
+version: '3'
+
+tasks:
+  default:
+    desc: Build the provider
+    cmds:
+      - task: build
+
+  build:
+    desc: Build the Terraform provider binary
+    cmds:
+      - go build -o terraform-provider-clickhouse-schema
+
+  install:
+    desc: Install the provider locally for development
+    deps: [ build ]
+    cmds:
+      - mkdir -p ~/.terraform.d/plugins/registry.terraform.io/erwanncloarec/clickhouse-schema/0.1.0/darwin_arm64
+      - cp terraform-provider-clickhouse-schema ~/.terraform.d/plugins/registry.terraform.io/erwanncloarec/clickhouse-schema/0.1.0/darwin_arm64/
+
+  test:
+    desc: Run tests
+    cmds:
+      - go test ./...
+
+  clean:
+    desc: Clean build artifacts
+    cmds:
+      - rm -f terraform-provider-clickhouse-schema

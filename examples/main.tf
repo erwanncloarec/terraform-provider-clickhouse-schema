@@ -2,7 +2,6 @@ terraform {
   required_providers {
     clickhouse-schema = {
       source  = "erwanncloarec/clickhouse-schema"
-      version = "0.1.0"
     }
   }
 }
@@ -10,33 +9,38 @@ terraform {
 provider "clickhouse-schema" {
   host     = "localhost"
   port     = 9000
-  username = "default"
-  password = ""
+  username = "pbstck"
+  password = "pbstck"
   database = "default"
 }
 
-# Example resources (to be implemented)
-# resource "clickhouse-schema_database" "example" {
-#   name = "example_db"
-# }
+# Example table resource
+resource "clickhouse-schema_table" "example" {
+  name     = "example_table"
+  database = "default"
+  engine   = "MergeTree"
 
-# resource "clickhouse-schema_table" "example" {
-#   database = clickhouse-schema_database.example.name
-#   name     = "example_table"
-#   engine   = "MergeTree"
-#   columns = [
-#     {
-#       name = "id"
-#       type = "UInt64"
-#     },
-#     {
-#       name = "timestamp"
-#       type = "DateTime"
-#     },
-#     {
-#       name = "message"
-#       type = "String"
-#     }
-#   ]
-#   order_by = ["id"]
-# }
+  columns {
+    name = "id"
+    type = "UInt64"
+    comment = "Primary key"
+  }
+
+  columns {
+    name = "timestamp"
+    type = "DateTime"
+    comment = "Event timestamp"
+  }
+
+  columns {
+    name = "message"
+    type = "String"
+  }
+
+  columns {
+    name = "user_id"
+    type = "UInt32"
+  }
+
+  order_by = ["id"]
+}
