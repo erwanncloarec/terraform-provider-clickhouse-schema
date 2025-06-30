@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -195,16 +196,24 @@ func (r *TableResource) Read(ctx context.Context, req resource.ReadRequest, resp
 	database := parts[0]
 	tableName := parts[1]
 
-	// Query to check if table exists
-	query := `
-        SELECT COUNT(*) 
+	// Query to check if table exists and get engine
+	tableQuery := `
+        SELECT engine
         FROM system.tables 
         WHERE database = ? AND name = ?
     `
 
-	var count int
-	err := r.client.QueryRowContext(ctx, query, database, tableName).Scan(&count)
+	var actualEngine string
+	err := r.client.QueryRowContext(ctx, tableQuery, database, tableName).Scan(&actualEngine)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// Table doesn't exist, remove from state
+			tflog.Info(ctx, "Table no longer exists, removing from state", map[string]interface{}{
+				"id": data.ID.ValueString(),
+			})
+			resp.State.RemoveResource(ctx)
+			return
+		}
 		resp.Diagnostics.AddError(
 			"Error checking table existence",
 			fmt.Sprintf("Could not check if table %s exists: %s", data.ID.ValueString(), err.Error()),
@@ -212,17 +221,59 @@ func (r *TableResource) Read(ctx context.Context, req resource.ReadRequest, resp
 		return
 	}
 
-	if count == 0 {
-		// Table doesn't exist, remove from state
-		tflog.Info(ctx, "Table no longer exists, removing from state", map[string]interface{}{
-			"id": data.ID.ValueString(),
-		})
-		resp.State.RemoveResource(ctx)
+	// Validate engine matches
+	if actualEngine != data.Engine.ValueString() {
+		resp.Diagnostics.AddError(
+			"Table engine mismatch",
+			fmt.Sprintf("Expected engine '%s', but table has engine '%s'",
+				data.Engine.ValueString(), actualEngine),
+		)
 		return
 	}
 
-	tflog.Info(ctx, "Table exists", map[string]interface{}{
-		"id": data.ID.ValueString(),
+	// Get actual column schema
+	actualColumns, err := r.getTableColumns(ctx, database, tableName)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error reading table schema",
+			fmt.Sprintf("Could not read schema for table %s: %s", data.ID.ValueString(), err.Error()),
+		)
+		return
+	}
+
+	// Validate columns match expected schema
+	if err := r.validateColumns(data.Columns, actualColumns); err != nil {
+		resp.Diagnostics.AddError(
+			"Table schema mismatch",
+			fmt.Sprintf("Table schema does not match configuration: %s", err.Error()),
+		)
+		return
+	}
+
+	// Get actual ORDER BY clause if it's a MergeTree family engine
+	if r.isMergeTreeFamily(actualEngine) {
+		actualOrderBy, err := r.getTableOrderBy(ctx, database, tableName)
+		if err != nil {
+			resp.Diagnostics.AddError(
+				"Error reading table ORDER BY",
+				fmt.Sprintf("Could not read ORDER BY for table %s: %s", data.ID.ValueString(), err.Error()),
+			)
+			return
+		}
+
+		// Validate ORDER BY matches
+		if err := r.validateOrderBy(data.OrderBy, actualOrderBy); err != nil {
+			resp.Diagnostics.AddError(
+				"Table ORDER BY mismatch",
+				fmt.Sprintf("Table ORDER BY does not match configuration: %s", err.Error()),
+			)
+			return
+		}
+	}
+
+	tflog.Info(ctx, "Table schema validation successful", map[string]interface{}{
+		"id":     data.ID.ValueString(),
+		"engine": actualEngine,
 	})
 
 	// Save updated data into Terraform state
@@ -238,12 +289,8 @@ func (r *TableResource) Update(ctx context.Context, req resource.UpdateRequest, 
 		return
 	}
 
-	// TODO: Implement table updates (ALTER TABLE statements)
-	// For now, we'll just log what would be updated
-	fmt.Printf("Would update table %s\n", data.ID.ValueString())
-
-	// Save updated data into Terraform state
-	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
+	// Not implemented yet
+	resp.Diagnostics.AddError("Update is not implemented", "Update is not implemented")
 }
 
 func (r *TableResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
@@ -279,12 +326,121 @@ func (r *TableResource) Delete(ctx context.Context, req resource.DeleteRequest, 
 }
 
 func (r *TableResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-	// TODO: Implement import functionality
-	// For now, we'll use the ID as the import identifier
-	resp.Diagnostics.AddError(
-		"Import Not Implemented",
-		"Table import is not yet implemented",
-	)
+	// Expected format: database.table
+	parts := strings.Split(req.ID, ".")
+	if len(parts) != 2 {
+		resp.Diagnostics.AddError(
+			"Invalid import identifier",
+			fmt.Sprintf("Expected format 'database.table', got: %s", req.ID),
+		)
+		return
+	}
+
+	database := parts[0]
+	tableName := parts[1]
+
+	// Validate that both database and table name are not empty
+	if database == "" || tableName == "" {
+		resp.Diagnostics.AddError(
+			"Invalid import identifier",
+			"Database and table names cannot be empty",
+		)
+		return
+	}
+
+	tflog.Info(ctx, "Importing ClickHouse table", map[string]interface{}{
+		"database": database,
+		"table":    tableName,
+		"id":       req.ID,
+	})
+
+	// Check if table exists and get its properties
+	tableQuery := `
+        SELECT engine
+        FROM system.tables 
+        WHERE database = ? AND name = ?
+    `
+
+	var engine string
+	err := r.client.QueryRowContext(ctx, tableQuery, database, tableName).Scan(&engine)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			resp.Diagnostics.AddError(
+				"Table not found",
+				fmt.Sprintf("Table %s.%s does not exist in ClickHouse", database, tableName),
+			)
+			return
+		}
+		resp.Diagnostics.AddError(
+			"Error checking table existence",
+			fmt.Sprintf("Could not check if table %s.%s exists: %s", database, tableName, err.Error()),
+		)
+		return
+	}
+
+	// Get table columns
+	columns, err := r.getTableColumns(ctx, database, tableName)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error reading table schema",
+			fmt.Sprintf("Could not read schema for table %s.%s: %s", database, tableName, err.Error()),
+		)
+		return
+	}
+
+	// Convert columns map to slice for the model
+	var columnModels []ColumnModel
+	for _, col := range columns {
+		columnModel := ColumnModel{
+			Name: types.StringValue(col.Name),
+			Type: types.StringValue(col.Type),
+		}
+
+		if col.Comment != "" {
+			columnModel.Comment = types.StringValue(col.Comment)
+		} else {
+			columnModel.Comment = types.StringNull()
+		}
+
+		columnModels = append(columnModels, columnModel)
+	}
+
+	// Get ORDER BY clause if it's a MergeTree family engine
+	var orderBy []types.String
+	if r.isMergeTreeFamily(engine) {
+		orderByColumns, err := r.getTableOrderBy(ctx, database, tableName)
+		if err != nil {
+			resp.Diagnostics.AddError(
+				"Error reading table ORDER BY",
+				fmt.Sprintf("Could not read ORDER BY for table %s.%s: %s", database, tableName, err.Error()),
+			)
+			return
+		}
+
+		// Convert to types.String slice
+		for _, col := range orderByColumns {
+			orderBy = append(orderBy, types.StringValue(col))
+		}
+	}
+
+	// Create the resource model with imported data
+	data := TableResourceModel{
+		ID:       types.StringValue(req.ID),
+		Name:     types.StringValue(tableName),
+		Database: types.StringValue(database),
+		Engine:   types.StringValue(engine),
+		Columns:  columnModels,
+		OrderBy:  orderBy,
+	}
+
+	tflog.Info(ctx, "Successfully imported ClickHouse table", map[string]interface{}{
+		"id":      data.ID.ValueString(),
+		"engine":  engine,
+		"columns": len(columnModels),
+	})
+
+	// Set the imported state
+	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
 
 // generateCreateTableSQL generates the CREATE TABLE SQL statement
@@ -320,4 +476,150 @@ func (r *TableResource) generateCreateTableSQL(data TableResourceModel) string {
 	}
 
 	return sql
+}
+
+// getTableColumns retrieves the actual column schema from ClickHouse
+func (r *TableResource) getTableColumns(ctx context.Context, database, tableName string) (map[string]ColumnInfo, error) {
+	query := `
+        SELECT name, type, comment
+        FROM system.columns
+        WHERE database = ? AND table = ?
+        ORDER BY position
+    `
+
+	rows, err := r.client.QueryContext(ctx, query, database, tableName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	columns := make(map[string]ColumnInfo)
+	for rows.Next() {
+		var name, colType string
+		var comment sql.NullString
+
+		if err := rows.Scan(&name, &colType, &comment); err != nil {
+			return nil, err
+		}
+
+		columns[name] = ColumnInfo{
+			Name:    name,
+			Type:    colType,
+			Comment: comment.String,
+		}
+	}
+
+	return columns, rows.Err()
+}
+
+// getTableOrderBy retrieves the ORDER BY clause from ClickHouse
+func (r *TableResource) getTableOrderBy(ctx context.Context, database, tableName string) ([]string, error) {
+	query := `
+        SELECT sorting_key
+        FROM system.tables
+        WHERE database = ? AND name = ?
+    `
+
+	var sortingKey sql.NullString
+	err := r.client.QueryRowContext(ctx, query, database, tableName).Scan(&sortingKey)
+	if err != nil {
+		return nil, err
+	}
+
+	if !sortingKey.Valid || sortingKey.String == "" {
+		return []string{}, nil
+	}
+
+	// Parse the sorting key (remove parentheses and split by comma)
+	orderBy := strings.Trim(sortingKey.String, "()")
+	if orderBy == "" {
+		return []string{}, nil
+	}
+
+	columns := strings.Split(orderBy, ",")
+	for i, col := range columns {
+		columns[i] = strings.TrimSpace(col)
+	}
+
+	return columns, nil
+}
+
+// validateColumns compares expected vs actual columns
+func (r *TableResource) validateColumns(expectedCols []ColumnModel, actualCols map[string]ColumnInfo) error {
+	// Check if we have the right number of columns
+	if len(expectedCols) != len(actualCols) {
+		return fmt.Errorf("expected %d columns, found %d columns", len(expectedCols), len(actualCols))
+	}
+
+	// Check each expected column
+	for _, expected := range expectedCols {
+		actual, exists := actualCols[expected.Name.ValueString()]
+		if !exists {
+			return fmt.Errorf("column '%s' not found in table", expected.Name.ValueString())
+		}
+
+		// Validate column type
+		if actual.Type != expected.Type.ValueString() {
+			return fmt.Errorf("column '%s': expected type '%s', found type '%s'",
+				expected.Name.ValueString(), expected.Type.ValueString(), actual.Type)
+		}
+
+		// Validate comment if specified
+		expectedComment := ""
+		if !expected.Comment.IsNull() && !expected.Comment.IsUnknown() {
+			expectedComment = expected.Comment.ValueString()
+		}
+
+		if actual.Comment != expectedComment {
+			return fmt.Errorf("column '%s': expected comment '%s', found comment '%s'",
+				expected.Name.ValueString(), expectedComment, actual.Comment)
+		}
+	}
+
+	return nil
+}
+
+// validateOrderBy compares expected vs actual ORDER BY clauses
+func (r *TableResource) validateOrderBy(expected []types.String, actual []string) error {
+	expectedStrs := make([]string, len(expected))
+	for i, e := range expected {
+		expectedStrs[i] = e.ValueString()
+	}
+
+	if len(expectedStrs) != len(actual) {
+		return fmt.Errorf("expected ORDER BY with %d columns, found %d columns",
+			len(expectedStrs), len(actual))
+	}
+
+	for i, expectedCol := range expectedStrs {
+		if expectedCol != actual[i] {
+			return fmt.Errorf("ORDER BY column %d: expected '%s', found '%s'",
+				i+1, expectedCol, actual[i])
+		}
+	}
+
+	return nil
+}
+
+// isMergeTreeFamily checks if the engine is part of MergeTree family
+func (r *TableResource) isMergeTreeFamily(engine string) bool {
+	mergeTreeEngines := []string{
+		"MergeTree", "ReplacingMergeTree", "SummingMergeTree",
+		"AggregatingMergeTree", "CollapsingMergeTree", "VersionedCollapsingMergeTree",
+		"GraphiteMergeTree",
+	}
+
+	for _, mt := range mergeTreeEngines {
+		if strings.HasPrefix(engine, mt) {
+			return true
+		}
+	}
+	return false
+}
+
+// ColumnInfo represents actual column information from ClickHouse
+type ColumnInfo struct {
+	Name    string
+	Type    string
+	Comment string
 }
