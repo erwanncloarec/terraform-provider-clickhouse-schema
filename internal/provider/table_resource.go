@@ -2,13 +2,16 @@ package provider
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 )
 
 // Ensure provider defined types fully satisfy framework interfaces.
@@ -21,7 +24,7 @@ func NewTableResource() resource.Resource {
 
 // TableResource defines the resource implementation.
 type TableResource struct {
-	// client *clickhouse.Client // We'll add this later
+	client *sql.DB
 }
 
 // TableResourceModel describes the resource data model.
@@ -113,16 +116,16 @@ func (r *TableResource) Configure(ctx context.Context, req resource.ConfigureReq
 		return
 	}
 
-	// TODO: Configure ClickHouse client here
-	// client, ok := req.ProviderData.(*clickhouse.Client)
-	// if !ok {
-	//     resp.Diagnostics.AddError(
-	//         "Unexpected Resource Configure Type",
-	//         fmt.Sprintf("Expected *clickhouse.Client, got: %T", req.ProviderData),
-	//     )
-	//     return
-	// }
-	// r.client = client
+	client, ok := req.ProviderData.(*sql.DB)
+	if !ok {
+		resp.Diagnostics.AddError(
+			"Unexpected Resource Configure Type",
+			fmt.Sprintf("Expected *sql.DB, got: %T. Please report this issue to the provider developers.", req.ProviderData),
+		)
+		return
+	}
+
+	r.client = client
 }
 
 func (r *TableResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -142,18 +145,29 @@ func (r *TableResource) Create(ctx context.Context, req resource.CreateRequest, 
 	// Generate the CREATE TABLE SQL
 	createSQL := r.generateCreateTableSQL(data)
 
-	// Show the SQL that would be executed
-	resp.Diagnostics.AddWarning(
-		"SQL to be executed",
-		fmt.Sprintf("The following SQL will be executed:\n\n%s", createSQL),
-	)
+	tflog.Info(ctx, "Creating ClickHouse table", map[string]interface{}{
+		"sql": createSQL,
+	})
 
-	// TODO: Execute the SQL against ClickHouse
-	// For now, we'll just simulate success
-	fmt.Printf("Executing SQL: %s\n", createSQL)
+	// Execute the SQL against ClickHouse
+	_, err := r.client.ExecContext(ctx, createSQL)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error creating table",
+			fmt.Sprintf("Could not create table %s.%s: %s",
+				data.Database.ValueString(),
+				data.Name.ValueString(),
+				err.Error()),
+		)
+		return
+	}
 
 	// Set the ID (combination of database and table name)
 	data.ID = types.StringValue(fmt.Sprintf("%s.%s", data.Database.ValueString(), data.Name.ValueString()))
+
+	tflog.Info(ctx, "Successfully created ClickHouse table", map[string]interface{}{
+		"id": data.ID.ValueString(),
+	})
 
 	// Save data into Terraform state
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
@@ -168,9 +182,48 @@ func (r *TableResource) Read(ctx context.Context, req resource.ReadRequest, resp
 		return
 	}
 
-	// TODO: Query ClickHouse to check if table exists and get its schema
-	// For now, we'll assume the table exists
-	fmt.Printf("Would check if table %s exists\n", data.ID.ValueString())
+	// Check if table exists
+	parts := strings.Split(data.ID.ValueString(), ".")
+	if len(parts) != 2 {
+		resp.Diagnostics.AddError(
+			"Invalid table ID",
+			fmt.Sprintf("Expected format 'database.table', got: %s", data.ID.ValueString()),
+		)
+		return
+	}
+
+	database := parts[0]
+	tableName := parts[1]
+
+	// Query to check if table exists
+	query := `
+        SELECT COUNT(*) 
+        FROM system.tables 
+        WHERE database = ? AND name = ?
+    `
+
+	var count int
+	err := r.client.QueryRowContext(ctx, query, database, tableName).Scan(&count)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error checking table existence",
+			fmt.Sprintf("Could not check if table %s exists: %s", data.ID.ValueString(), err.Error()),
+		)
+		return
+	}
+
+	if count == 0 {
+		// Table doesn't exist, remove from state
+		tflog.Info(ctx, "Table no longer exists, removing from state", map[string]interface{}{
+			"id": data.ID.ValueString(),
+		})
+		resp.State.RemoveResource(ctx)
+		return
+	}
+
+	tflog.Info(ctx, "Table exists", map[string]interface{}{
+		"id": data.ID.ValueString(),
+	})
 
 	// Save updated data into Terraform state
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
@@ -202,12 +255,27 @@ func (r *TableResource) Delete(ctx context.Context, req resource.DeleteRequest, 
 		return
 	}
 
-	// TODO: Execute DROP TABLE statement
+	// Execute DROP TABLE statement
 	dropSQL := fmt.Sprintf("DROP TABLE IF EXISTS %s.%s",
 		data.Database.ValueString(),
 		data.Name.ValueString())
 
-	fmt.Printf("Would execute SQL: %s\n", dropSQL)
+	tflog.Info(ctx, "Dropping ClickHouse table", map[string]interface{}{
+		"sql": dropSQL,
+	})
+
+	_, err := r.client.ExecContext(ctx, dropSQL)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error dropping table",
+			fmt.Sprintf("Could not drop table %s: %s", data.ID.ValueString(), err.Error()),
+		)
+		return
+	}
+
+	tflog.Info(ctx, "Successfully dropped ClickHouse table", map[string]interface{}{
+		"id": data.ID.ValueString(),
+	})
 }
 
 func (r *TableResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {

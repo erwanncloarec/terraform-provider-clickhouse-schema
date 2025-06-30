@@ -2,12 +2,15 @@ package provider
 
 import (
 	"context"
+	"fmt"
 
+	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 )
 
 func New() provider.Provider {
@@ -65,8 +68,68 @@ func (p *clickhouseSchemaProvider) Configure(ctx context.Context, req provider.C
 		return
 	}
 
-	// TODO: Create ClickHouse client configuration
-	// Store client in resp.ResourceData and resp.DataSourceData for resources/data sources to use
+	// Set default values
+	host := "localhost"
+	if !config.Host.IsNull() && !config.Host.IsUnknown() {
+		host = config.Host.ValueString()
+	}
+
+	port := int(9000)
+	if !config.Port.IsNull() && !config.Port.IsUnknown() {
+		port = int(config.Port.ValueInt64())
+	}
+
+	username := "default"
+	if !config.Username.IsNull() && !config.Username.IsUnknown() {
+		username = config.Username.ValueString()
+	}
+
+	password := ""
+	if !config.Password.IsNull() && !config.Password.IsUnknown() {
+		password = config.Password.ValueString()
+	}
+
+	database := "default"
+	if !config.Database.IsNull() && !config.Database.IsUnknown() {
+		database = config.Database.ValueString()
+	}
+
+	// Create ClickHouse connection
+	conn := clickhouse.OpenDB(&clickhouse.Options{
+		//Addr: []string{fmt.Sprintf("%s:%d", host, port)},
+		Addr: []string{"localhost:9000"}, // Default to localhost:9000 if not specified
+		Auth: clickhouse.Auth{
+			Database: database,
+			Username: username,
+			Password: password,
+		},
+		Settings: clickhouse.Settings{
+			"max_execution_time": 60,
+		},
+		Compression: &clickhouse.Compression{
+			Method: clickhouse.CompressionLZ4,
+		},
+	})
+
+	// Test the connection
+	if err := conn.Ping(); err != nil {
+		resp.Diagnostics.AddError(
+			"Unable to connect to ClickHouse",
+			fmt.Sprintf("Failed to connect to ClickHouse at %s:%d: %s", host, port, err.Error()),
+		)
+		return
+	}
+
+	tflog.Info(ctx, "Connected to ClickHouse", map[string]interface{}{
+		"host":     host,
+		"port":     port,
+		"username": username,
+		"database": database,
+	})
+
+	// Store the connection in both ResourceData and DataSourceData
+	resp.ResourceData = conn
+	resp.DataSourceData = conn
 }
 
 func (p *clickhouseSchemaProvider) Resources(ctx context.Context) []func() resource.Resource {

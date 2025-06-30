@@ -1,7 +1,8 @@
 terraform {
   required_providers {
     clickhouse-schema = {
-      source  = "erwanncloarec/clickhouse-schema"
+      source = "erwanncloarec/clickhouse-schema"
+      # No version constraint when using dev_overrides
     }
   }
 }
